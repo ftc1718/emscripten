@@ -1664,23 +1664,34 @@ def emscript_wasm_backend(infile, settings, outfile, libraries=None, compiler_en
 
   if libraries is None: libraries = []
 
-  wast = build_wasm(temp_files, infile, outfile, settings, DEBUG)
+  def read_metadata(wast_file):
+    with open(wast_file) as f:
+      parts = f.read().split('\n;; METADATA:')
+    assert len(parts) == 2
+    return parts[1]
 
+  if shared.Settings.WASM_BACKEND == 2:
+    with temp_files.get_file('.wasm') as temp_wasm:
+      build_wasm_lld(temp_files, infile, temp_wasm, settings, DEBUG)
+      wast = wasm_dis(temp_wasm)
+    sending = []
+    receiving = []
+    invoke_funcs = []
+    pre = ''
+    post = ''
+    metadata_raw = '{}'
+  else:
+    wast = build_wasm_s2wasm(temp_files, infile, outfile, settings, DEBUG)
+    # Integrate info from backend
+    metadata_raw = read_metadata(wast)
+
+  import pprint
   # js compiler
-
   if DEBUG: logging.debug('emscript: js compiler glue')
 
-  # Integrate info from backend
-
-  output = open(wast).read()
-  parts = output.split('\n;; METADATA:')
-  assert len(parts) == 2
-  metadata_raw = parts[1]
-  parts = output = None
-
-  if DEBUG: logging.debug("METAraw %s", metadata_raw)
+  if DEBUG: logging.debug("METAraw: %s", pprint.pformat(metadata_raw))
   metadata = create_metadata_wasm(metadata_raw, wast)
-  if DEBUG: logging.debug(repr(metadata))
+  if DEBUG: logging.debug("meta: %s", pprint.pformat(metadata))
 
   update_settings_glue(settings, metadata)
 
@@ -1740,27 +1751,64 @@ def emscript_wasm_backend(infile, settings, outfile, libraries=None, compiler_en
   outfile.close()
 
 
-def build_wasm(temp_files, infile, outfile, settings, DEBUG):
+def wasm_dis(wasm_file):
+  wast = wasm_file + '.wast'
+  wasm_dis_args = [os.path.join(shared.Settings.BINARYEN_ROOT, 'bin', 'wasm-dis'), wasm_file, '-o', wast]
+  logging.debug('emscript: wasm-dis: ' + ' '.join(wasm_dis_args))
+  shared.check_call(wasm_dis_args)
+  return wast
+
+
+def archive_intermediate(filename, output_name):
+  output_name = os.path.join(shared.CANONICAL_TEMP_DIR, output_name)
+  logging.debug('emscript: archiving: ' + output_name)
+  shutil.copyfile(filename, output_name)
+
+
+def link_bitcode_wasm(infile, outfile, settings, DEBUG):
+  backend_args = create_backend_args_wasm(infile, outfile, settings)
+  if DEBUG:
+    logging.debug('emscript: llvm wasm backend: ' + ' '.join(backend_args))
+    t = time.time()
+  shared.check_call(backend_args)
+  if DEBUG:
+    logging.debug('  emscript: llvm wasm backend took %s seconds' % (time.time() - t))
+    if shared.Settings.WASM_BACKEND == 2:
+      ext = ".o"
+    else:
+      ext = ".s"
+
+    archive_intermediate(outfile, 'emcc-llvm-backend-output' + ext)
+
+
+def build_wasm_lld(temp_files, infile, outfile, settings, DEBUG):
+  with temp_files.get_file('.wb.o') as temp_o:
+    # Link bitcode files to a single wasm object
+    link_bitcode_wasm(infile, temp_o, settings, DEBUG)
+
+    lld_args = create_lld_args(temp_o, outfile)
+    if DEBUG:
+      logging.debug('emscript: lld: ' + ' '.join(lld_args))
+      t = time.time()
+    shared.check_call(lld_args)
+    if DEBUG:
+      logging.debug('  emscript: lld took %s seconds' % (time.time() - t))
+      archive_intermediate(outfile, 'emcc-lld-output.wasm')
+
+
+def build_wasm_s2wasm(temp_files, infile, outfile, settings, DEBUG):
   with temp_files.get_file('.wb.s') as temp_s:
-    backend_args = create_backend_args_wasm(infile, temp_s, settings)
-    if DEBUG:
-      logging.debug('emscript: llvm wasm backend: ' + ' '.join(backend_args))
-      t = time.time()
-    shared.check_call(backend_args)
-    if DEBUG:
-      logging.debug('  emscript: llvm wasm backend took %s seconds' % (time.time() - t))
-      t = time.time()
-      shutil.copyfile(temp_s, os.path.join(shared.CANONICAL_TEMP_DIR, 'emcc-llvm-backend-output.s'))
+    link_bitcode_wasm(infile, temp_s, settings, DEBUG)
 
     assert shared.Settings.BINARYEN_ROOT, 'need BINARYEN_ROOT config set so we can use Binaryen s2wasm on the backend output'
+
     basename = shared.unsuffixed(outfile.name)
     wast = basename + '.wast'
-    s2wasm_args = create_s2wasm_args(temp_s)
+    s2wasm_args = create_s2wasm_args(temp_s, wast)
     if DEBUG:
       logging.debug('emscript: binaryen s2wasm: ' + ' '.join(s2wasm_args))
       t = time.time()
-      #s2wasm_args += ['--debug']
-    shared.check_call(s2wasm_args, stdout=open(wast, 'w'))
+    shared.check_call(s2wasm_args)
     # Also convert wasm text to binary
     wasm_as_args = [os.path.join(shared.Settings.BINARYEN_ROOT, 'bin', 'wasm-as'),
                     wast, '-o', basename + '.wasm']
@@ -1772,13 +1820,16 @@ def build_wasm(temp_files, infile, outfile, settings, DEBUG):
   if DEBUG:
     logging.debug('  emscript: binaryen s2wasm took %s seconds' % (time.time() - t))
     t = time.time()
-    shutil.copyfile(wast, os.path.join(shared.CANONICAL_TEMP_DIR, 'emcc-s2wasm-output.wast'))
+    archive_intermediate(wast, 'emcc-s2wasm-output.wast')
   return wast
 
 
 def create_metadata_wasm(metadata_raw, wast):
   metadata = load_metadata(metadata_raw)
   add_metadata_from_wast(metadata, wast)
+  for key in metadata.keys():
+    if type(metadata[key]) == list:
+      metadata[key] = sorted(metadata[key])
   return metadata
 
 
@@ -1934,11 +1985,14 @@ Runtime.getTempRet0 = Module['getTempRet0'];
   module.append(invoke_wrappers)
   return module
 
-def create_backend_args_wasm(infile, temp_s, settings):
+
+def create_backend_args_wasm(infile, output, settings):
   backend_compiler = os.path.join(shared.LLVM_ROOT, 'llc')
-  args = [backend_compiler, infile, '-march=wasm32', '-filetype=asm',
-                  '-asm-verbose=false',
-                  '-o', temp_s]
+  args = [backend_compiler, infile, '-o', output]
+  if shared.Settings.WASM_BACKEND == 2:
+    args += ['-mtriple=wasm32-unknown-uknown-wasm', '-filetype=obj']
+  else:
+    args += ['-mtriple=wasm32-unknown-unknown-elf', '-filetype=asm', '-asm-verbose=false']
   args += ['-thread-model=single'] # no threads support in backend, tell llc to not emit atomics
   # disable slow and relatively unimportant optimization passes
   args += ['-combiner-global-alias-analysis=false']
@@ -1955,7 +2009,7 @@ def create_backend_args_wasm(infile, temp_s, settings):
   return args
 
 
-def create_s2wasm_args(temp_s):
+def create_s2wasm_args(temp_s, output):
   def wasm_rt_fail(archive_file):
     def wrapped():
       raise Exception('Expected {} to already be built'.format(archive_file))
@@ -1970,6 +2024,24 @@ def create_s2wasm_args(temp_s):
   args += ['--initial-memory=%d' % shared.Settings.TOTAL_MEMORY]
   args += ['--allow-memory-growth'] if shared.Settings.ALLOW_MEMORY_GROWTH else []
   args += ['-l', compiler_rt_lib, '-l', libc_rt_lib]
+  args += ['-o', output]
+  return args
+
+
+def create_lld_args(temp_o, output):
+  def wasm_rt_fail(archive_file):
+    def wrapped():
+      raise Exception('Expected {} to already be built'.format(archive_file))
+    return wrapped
+  compiler_rt_lib = shared.Cache.get('libwasm_compiler_rt.a', wasm_rt_fail('libwasm_compiler_rt.a'), 'a')
+  libc_rt_lib = shared.Cache.get('libwasm_libc_rt.a', wasm_rt_fail('libwasm_libc_rt.a'), 'a')
+
+  args = [shared.LLVM_LLD, '-flavor', 'wasm', temp_o] #, '--strip-debug']
+  args += ['-entry', 'main', '--import-memory', '-allow-undefined']
+  args += ['--global-base=%d' % shared.Settings.GLOBAL_BASE]
+  args += ['--initial-memory=%d' % shared.Settings.TOTAL_MEMORY]
+  args += [compiler_rt_lib, libc_rt_lib]
+  args += ['-o', output]
   return args
 
 

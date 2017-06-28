@@ -729,6 +729,7 @@ CLANG_CC=os.path.expanduser(build_clang_tool_path(exe_suffix('clang')))
 CLANG_CPP=os.path.expanduser(build_clang_tool_path(exe_suffix('clang++')))
 CLANG=CLANG_CPP
 LLVM_LINK=build_llvm_tool_path(exe_suffix('llvm-link'))
+LLVM_LLD=build_llvm_tool_path(exe_suffix('lld'))
 LLVM_AR=build_llvm_tool_path(exe_suffix('llvm-ar'))
 LLVM_OPT=os.path.expanduser(build_llvm_tool_path(exe_suffix('opt')))
 LLVM_AS=os.path.expanduser(build_llvm_tool_path(exe_suffix('llvm-as')))
@@ -916,7 +917,10 @@ def check_vanilla():
   # if the env var tells us what to do, do that
   if 'EMCC_WASM_BACKEND' in os.environ:
     if os.environ['EMCC_WASM_BACKEND'] != '0':
-      logging.debug('EMCC_WASM_BACKEND tells us to use wasm backend')
+      if os.environ['EMCC_WASM_BACKEND'] == '2':
+        logging.debug('EMCC_WASM_BACKEND tells us to use wasm backend (lld)')
+      else:
+        logging.debug('EMCC_WASM_BACKEND tells us to use wasm backend (s2wasm)')
       LLVM_TARGET = WASM_TARGET
     else:
       logging.debug('EMCC_WASM_BACKEND tells us to use asm.js backend')
@@ -952,7 +956,7 @@ def check_vanilla():
       is_vanilla = check_vanilla()
     temp_cache = None
     if is_vanilla:
-      logging.debug('check tells us to use wasm backend')
+      logging.debug('check tells us to use wasm backend (s2wasm)')
       LLVM_TARGET = WASM_TARGET
     else:
       logging.debug('check tells us to use asm.js backend')
@@ -1170,7 +1174,10 @@ class Settings2(type):
           exec declare
 
       if get_llvm_target() == WASM_TARGET:
-        self.attrs['WASM_BACKEND'] = 1
+        if os.environ.get('EMCC_WASM_BACKEND') == '2':
+          self.attrs['WASM_BACKEND'] = 2
+        else:
+          self.attrs['WASM_BACKEND'] = 1
 
     # Transforms the Settings information into emcc-compatible args (-s X=Y, etc.). Basically
     # the reverse of load_settings, except for -Ox which is relevant there but not here
